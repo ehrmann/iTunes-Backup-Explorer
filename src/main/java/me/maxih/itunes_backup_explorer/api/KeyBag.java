@@ -13,6 +13,8 @@ import javax.crypto.spec.SecretKeySpec;
 import java.io.*;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
 import java.security.InvalidAlgorithmParameterException;
 import java.security.InvalidKeyException;
 import java.security.Key;
@@ -190,10 +192,6 @@ public class KeyBag {
         }
     }
 
-    public InputStream decryptStream(byte[] protectionClass, byte[] persistentKey, InputStream source) throws UnsupportedCryptoException, BackupReadException, NotUnlockedException, InvalidKeyException {
-        return decryptStream(protectionClass, persistentKey, source, "AES/CBC/PKCS5Padding");
-    }
-
     protected void decryptFilePaddingFallback(byte[] protectionClass, byte[] persistentKey, File source, File destination, long size) throws IOException, BackupReadException, UnsupportedCryptoException, NotUnlockedException, InvalidKeyException {
         try (
                 BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(source), BUFFER_SIZE);
@@ -214,27 +212,53 @@ public class KeyBag {
     }
 
     public void decryptFile(byte[] protectionClass, byte[] persistentKey, File source, File destination, long size) throws IOException, BackupReadException, UnsupportedCryptoException, NotUnlockedException, InvalidKeyException {
-        try (
-                BufferedInputStream inputStream = new BufferedInputStream(new FileInputStream(source), BUFFER_SIZE);
-                InputStream decryptStream = decryptStream(protectionClass, persistentKey, inputStream);
+        try {
+            var cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            cipher.init(
+                    Cipher.DECRYPT_MODE,
+                    new SecretKeySpec(this.unwrapKeyForClass(protectionClass, persistentKey), "AES"),
+                    new IvParameterSpec(new byte[16]));
+            try (var inChannel = Files.newByteChannel(source.toPath(), StandardOpenOption.READ);
+                var outChannel = Files.newByteChannel(destination.toPath(), StandardOpenOption.WRITE, StandardOpenOption.CREATE)) {
+                var inBuffer = ByteBuffer.allocate(16384);
+                var outBuffer = ByteBuffer.allocate(16400);
+                var bytesWritten = 0L;
 
-                FileOutputStream fileOutputStream = new FileOutputStream(destination);
-                BufferedOutputStream outputStream = new BufferedOutputStream(fileOutputStream, BUFFER_SIZE)
-        ) {
-            decryptStream.transferTo(outputStream);
-            outputStream.flush();
+                int read;
+                do {
+                    read = inChannel.read(inBuffer);
+                    inBuffer.flip();
+                    if (outBuffer.remaining() < cipher.getOutputSize(inBuffer.remaining())) {
+                        outBuffer = ByteBuffer.allocate(cipher.getOutputSize(inBuffer.remaining()));
+                    }
+                    if (read > 0) {
+                        cipher.update(inBuffer, outBuffer);
+                    } else {
+                        cipher.doFinal(inBuffer, outBuffer);
+                    }
 
-            if (size != -1L && fileOutputStream.getChannel().size() != size) {
-                System.out.printf("Warning: File size from database doesn't match actual decrypted size - expected %9d, got %9d (%s)%n", size, fileOutputStream.getChannel().size(), destination.getPath());
+                    outBuffer.flip();
+                    bytesWritten += outChannel.write(outBuffer);
+                    inBuffer.clear();
+                    outBuffer.clear();
+                } while (read > 0);
+
+                if (size != -1L) {
+                    if (size < bytesWritten) {
+                        outChannel.truncate(size);
+                    } else if (size > bytesWritten) {
+                        outChannel.write(ByteBuffer.allocate((int) (size - bytesWritten)));
+                    }
+                }
             }
-        } catch (IOException e) {
-            if (e.getCause() instanceof BadPaddingException) {
-                System.out.println("Warning: Bad padding - " + e.getMessage() + " (" + destination.getPath() + ")");
-                System.out.println("Trying to decrypt again without padding...");
-                decryptFilePaddingFallback(protectionClass, persistentKey, source, destination, size);
-            } else {
-                throw e;
-            }
+        } catch (ShortBufferException e) {
+            throw new RuntimeException(e);
+        } catch (BadPaddingException |  IllegalBlockSizeException e) {
+            System.out.printf("Warning: Bad padding - %s (%s)%n", e.getMessage(), source.getPath());
+            System.out.println("Trying to decrypt again without padding...");
+            decryptFilePaddingFallback(protectionClass, persistentKey, source, destination, size);
+        } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidAlgorithmParameterException e) {
+            throw new UnsupportedCryptoException(e);
         }
     }
 
